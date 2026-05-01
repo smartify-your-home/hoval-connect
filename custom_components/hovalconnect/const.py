@@ -17,4 +17,6 @@ CONF_PLANT_ID = "plant_id"
 UPDATE_INTERVAL_SECONDS = 30
 TEMP_DURATION_DEFAULT = "fourHours"
 
-API_LIVE_VALUES = f"{API_BASE}/v3/api/statistics/live-values/{{plant_id}}"
+API_LIVE_VALUES  = f"{API_BASE}/v3/api/statistics/live-values/{{plant_id}}"
+API_TELEMETRY_HF = f"{API_BASE}/api/telemetry-data/high-frequency-mode"
+API_BOOTSTRAP    = f"{API_BASE}/api/bootstrap"

@@ -1,25 +1,53 @@
 """Hoval Connect API client."""
 from __future__ import annotations
-import logging, time
+import logging, time, asyncio
 import aiohttp
-from .const import AUTH_TOKEN_URL, CLIENT_ID, API_MY_PLANTS, API_PLANT_SETTINGS, API_CIRCUITS, API_TEMP_CHANGE, API_SET_PROGRAM, API_LIVE_VALUES
+from .const import (AUTH_TOKEN_URL, CLIENT_ID, API_MY_PLANTS, API_PLANT_SETTINGS,
+                    API_CIRCUITS, API_TEMP_CHANGE, API_SET_PROGRAM, API_LIVE_VALUES,
+                    API_TELEMETRY_HF, API_BOOTSTRAP)
 
 _LOGGER = logging.getLogger(__name__)
+
+_APP_VERSION = "3.2.0"
 
 APP_HEADERS = {
     "User-Agent": "HovalConnect/6022 CFNetwork/3860.400.51 Darwin/25.3.0",
     "Accept": "application/json",
     "x-requested-with": "XMLHttpRequest",
-    "hovalconnect-frontend-app-version": "3.1.4",
+    "hovalconnect-frontend-app-version": _APP_VERSION,
 }
 
 API_SET_CONSTANT = "https://azure-iot-prod.hoval.com/core/v3/plants/{plant_id}/circuits/{path}/programs"
+ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup?bundleId=com.hoval.connect2"
+
+
+async def fetch_app_version(session: aiohttp.ClientSession) -> str:
+    """Fetch current HovalConnect app version from iTunes API."""
+    try:
+        async with session.get(
+            ITUNES_LOOKUP_URL,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                results = data.get("results", [])
+                if results:
+                    version = results[0].get("version", "")
+                    if version:
+                        _LOGGER.info("HovalConnect app version from App Store: %s", version)
+                        return version
+    except Exception as err:
+        _LOGGER.debug("App Store version lookup failed: %s", err)
+    _LOGGER.debug("Using fallback app version: %s", _APP_VERSION)
+    return _APP_VERSION
+
 
 class HovalAuthError(Exception):
     pass
 
 class HovalAPIError(Exception):
     pass
+
 
 class HovalConnectAPI:
     def __init__(self, session: aiohttp.ClientSession, access_token: str, refresh_token: str) -> None:
@@ -29,16 +57,18 @@ class HovalConnectAPI:
         self._expires_at: float = time.monotonic() + 1800
         self._plant_token: str | None = None
         self._plant_token_expires: float = 0.0
-        self._on_token_refresh = None  # callback(access_token, refresh_token)
-        # Proactively refresh every 20 minutes (nicht erst wenn abgelaufen)
+        self._on_token_refresh = None
         self._proactive_refresh_interval: float = 20 * 60
 
     def set_token_refresh_callback(self, callback) -> None:
-        """Called whenever tokens are refreshed — use to persist new tokens."""
         self._on_token_refresh = callback
 
+    async def async_init(self) -> None:
+        """Fetch current app version from App Store (called once on setup)."""
+        version = await fetch_app_version(self._session)
+        APP_HEADERS["hovalconnect-frontend-app-version"] = version
+
     async def _ensure_access_token(self) -> None:
-        # Proactively refresh when less than 20 minutes remain
         proactive_threshold = self._expires_at - self._proactive_refresh_interval
         if time.monotonic() < proactive_threshold:
             return
@@ -76,6 +106,34 @@ class HovalConnectAPI:
         pt = await self._ensure_plant_token(plant_id)
         return {**APP_HEADERS, "Authorization": f"Bearer {self._access_token}", "x-plant-access-token": pt}
 
+    async def bootstrap(self) -> None:
+        """Initialize server-side session – required before API calls work."""
+        await self._ensure_access_token()
+        h = {**APP_HEADERS, "Authorization": f"Bearer {self._access_token}",
+             "Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            async with self._session.post(
+                API_BOOTSTRAP, data="", headers=h,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                _LOGGER.debug("Bootstrap: status=%d", resp.status)
+        except Exception as err:
+            _LOGGER.warning("Bootstrap error: %s", err)
+
+    async def trigger_high_frequency_mode(self, plant_id: str) -> None:
+        """Trigger high-frequency telemetry mode – keeps data fresh."""
+        h = await self._h(plant_id)
+        try:
+            async with self._session.post(
+                API_TELEMETRY_HF,
+                json={"plantExternalId": plant_id},
+                headers={**h, "Content-Type": "application/json"},
+            ) as resp:
+                data = await resp.json(content_type=None)
+                _LOGGER.debug("Telemetry HF mode: status=%d end=%s", resp.status, data.get("end"))
+        except Exception as err:
+            _LOGGER.warning("Telemetry HF mode error: %s", err)
+
     async def get_plants(self) -> list[dict]:
         await self._ensure_access_token()
         async with self._session.get(API_MY_PLANTS,
@@ -87,7 +145,6 @@ class HovalConnectAPI:
         async with self._session.get(API_CIRCUITS.format(plant_id=plant_id),
             headers=await self._h(plant_id)) as resp:
             if resp.status == 401:
-                # Token expired — force refresh of both tokens and retry once
                 _LOGGER.debug("401 on circuits, forcing token refresh")
                 self._expires_at = 0.0
                 self._plant_token = None
@@ -99,7 +156,6 @@ class HovalConnectAPI:
             return await resp.json(content_type=None)
 
     async def get_live_values(self, plant_id: str, circuit_path: str, circuit_type: str) -> dict:
-        """Live-Werte für einen Circuit: Temp, Modulation, Betriebsstunden etc."""
         h = await self._h(plant_id)
         url = f"{API_LIVE_VALUES.format(plant_id=plant_id)}?circuitPath={circuit_path}&circuitType={circuit_type}"
         async with self._session.get(url, headers=h) as resp:
@@ -107,28 +163,53 @@ class HovalConnectAPI:
                 return {}
             resp.raise_for_status()
             data = await resp.json(content_type=None)
-        # Convert list of {key, value} to dict
         return {item["key"]: item["value"] for item in data if "key" in item}
 
     async def set_temporary_change(self, plant_id: str, path: str, value: float, duration: str = "fourHours") -> None:
-        """Temporary temperature change (weekly program continues)."""
-        h = await self._h(plant_id)
-        async with self._session.post(
-            API_TEMP_CHANGE.format(plant_id=plant_id, path=path),
-            json={"duration": duration, "value": value},
-            headers={**h, "Content-Type": "application/json"},
-        ) as resp:
-            resp.raise_for_status()
+        """Temporary temperature change – retries on timeout/gateway errors."""
+        for attempt in range(3):
+            try:
+                h = await self._h(plant_id)
+                async with self._session.post(
+                    API_TEMP_CHANGE.format(plant_id=plant_id, path=path),
+                    json={"duration": duration, "value": value},
+                    headers={**h, "Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in (502, 503, 504):
+                        _LOGGER.warning("set_temporary_change attempt %d failed: %d", attempt+1, resp.status)
+                        await asyncio.sleep(3)
+                        continue
+                    resp.raise_for_status()
+                    return
+            except (aiohttp.ServerTimeoutError, aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as err:
+                _LOGGER.warning("set_temporary_change attempt %d error: %s", attempt+1, err)
+                if attempt < 2:
+                    await asyncio.sleep(3)
+        raise HovalAPIError("set_temporary_change failed after 3 attempts")
 
     async def set_constant_temp(self, plant_id: str, path: str, value: float) -> None:
-        """Dauerhafte Temperatur im Constant-Programm."""
-        h = await self._h(plant_id)
-        async with self._session.patch(
-            API_SET_CONSTANT.format(plant_id=plant_id, path=path),
-            json={"constant": {"value": value}},
-            headers={**h, "Content-Type": "application/json"},
-        ) as resp:
-            resp.raise_for_status()
+        """Set permanent temperature – retries on timeout/gateway errors."""
+        for attempt in range(3):
+            try:
+                h = await self._h(plant_id)
+                async with self._session.patch(
+                    API_SET_CONSTANT.format(plant_id=plant_id, path=path),
+                    json={"constant": {"value": value}},
+                    headers={**h, "Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in (502, 503, 504):
+                        _LOGGER.warning("set_constant_temp attempt %d failed: %d", attempt+1, resp.status)
+                        await asyncio.sleep(3)
+                        continue
+                    resp.raise_for_status()
+                    return
+            except (aiohttp.ServerTimeoutError, aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as err:
+                _LOGGER.warning("set_constant_temp attempt %d error: %s", attempt+1, err)
+                if attempt < 2:
+                    await asyncio.sleep(3)
+        raise HovalAPIError("set_constant_temp failed after 3 attempts")
 
     async def set_program(self, plant_id: str, path: str, program: str) -> None:
         """Switch program: week1, week2, constant."""
