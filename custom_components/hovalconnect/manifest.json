@@ -1,7 +1,7 @@
 {
   "domain": "hovalconnect",
   "name": "Hoval Connect",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "config_flow": true,
   "documentation": "https://github.com/yourusername/hovalconnect-ha",
   "issue_tracker": "https://github.com/yourusername/hovalconnect-ha/issues",
